@@ -2,11 +2,9 @@
 title: "Supplementary Information for Intra-tumor heterogeneity defines treatment-resistant HER2+ breast tumors"
 author: "Rye, Trinh et al"
 date: "4/1/2018"
-output: 
-  html_document:
-    toc: true
-    number_sections: true
-    toc_float: true
+output:
+  md_document:
+    variant: markdown_github
 ---
 
 ```{r setup, include=FALSE}
