@@ -1,0 +1,8 @@
+load("/Users/annetrinh/Dropbox (Personal)/Her2DiversityPaper_xxFinalxx/R_scripts/sweave/data/HER2datatset.RData")
+ls()
+head(df.All)
+load("/Users/annetrinh/Dropbox (Personal)/Her2DiversityPaper_xxFinalxx/R_scripts/sweave/data/Pat37data.RData")
+ls()
+head(df.New37)
+summary(df.New37$CellLabels)
+dim(df.New37)

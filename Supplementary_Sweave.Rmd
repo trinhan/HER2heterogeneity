@@ -1,0 +1,1115 @@
+---
+title: "Supplementary Information for Intra-tumor heterogeneity defines treatment-resistant HER2+ breast tumors"
+author: "Rye, Trinh et al"
+date: "4/1/2018"
+output: 
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning=F, fig.height=5)
+```
+
+This document summarises the data obtained and code required to reproduce the analysis from **"Intra-tumor heterogeneity defines treatment-resistant HER2+ breast tumors"**
+
+# Summary of packages and data set
+## Libraries and scripts required
+
+Below are the packages used and scripted functions required.
+
+```{r, echo=T, message=F}
+# packages
+library(ggplot2)
+library(gplots)
+library(RColorBrewer)
+library(reshape2)
+library(plyr)
+library(gclus)
+library(foreach)
+library(doParallel)
+library(survival)
+library(ggrepel)
+library(plotrix)
+library(survminer)
+ggPlotSurv=function(fit, data,title, pal){
+library(survminer)
+ggsurvplot(fit, data, risk.table = T,pval=T, linetype = 1, palette = pal, ggtheme = theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black")), title=title, break.time.by = 10, font.tickslab = 10, pval.size=4, fontsize=3, pval.method = T
+)
+}
+
+source("scripts/clustermap.R")
+source("scripts/readFiles.R")
+source("scripts/DiversityFunctions.R")
+RedBu=brewer.pal(11, "RdBu")
+```
+
+## Summary of patient single cell data 
+
+Single cell data obtained from tissue sections are summarised in the directories: <tt> "data/PreSurgerySamples", "data/PostSurgerySamples", "data/MetSamples"</tt>.
+
+```{r}
+# load in data
+#get an overview of the files required
+PreClinFiles=dir("data/PreSurgerySamples/")
+PostClinFiles=dir("data/PostSurgerySamples/")
+MetClinFiles=dir("data/MetSamples//")
+tp1=unique(c(substr(PreClinFiles, 1, 4), 
+             substr(PostClinFiles, 1, 4), 
+             substr(MetClinFiles, 1,4)))
+tp2=substr(PreClinFiles, 1, 9)
+tP2=substr(PostClinFiles, 1, 7)
+tm2=unlist(regmatches(MetClinFiles, regexec( "[0-9]+_[a-zA-Z]+[0-9]*", MetClinFiles)))
+```
+
+
+Below is a summary of the patient cohort, with the number of samples obtained for each patient stored in the variable <tt>PatTab</tt>. This table is shown in ** Supplementary Table 2**
+
+```{r}
+## Make table here
+PatTab=data.frame(Patient=unique(tp1),
+                  Prim.Region=sapply(tp1, function(x) length(unique(tp2[grep(x, tp2 )]))),
+                  Prim.N=sapply(tp1, function(x) length(grep(x, tp2 ))), 
+                  Surg.Regions=sapply(tp1, function(x) length(unique(tP2[grep(x, tP2 )]))),
+                  Surg.N=sapply(tp1, function(x) length(grep(x, tP2 ))),
+                  Met.Regions=sapply(tp1, function(x) length(unique(tm2[grep(x, tm2 )]))),
+                  Met.N=sapply(tp1, function(x) length(grep(x, tm2 ))) 
+)
+
+print(PatTab)
+
+```
+
+
+```{r}
+#Collate the data together into one data frame:
+
+PreSurg=readData('data/PreSurgerySamples/',20)
+PreSurgMelt=melt(PreSurg$ImSample, measure.vars=c("XLoc"))
+PreSurgMelt$L3=paste(PreSurgMelt$L1, PreSurgMelt$L2, sep="_")
+#Similarly, we can do this with the post surgery data:
+PostSurg=readData('data/PostSurgerySamples/',20)
+PostSurgMelt=melt(PostSurg$ImSample, measure.vars=c("XLoc"))
+PostSurgMelt$L3=paste(PostSurgMelt$L1, PostSurgMelt$L2, sep="_")
+# and mets:
+MetSamp=readData('data/MetSamples/',20)
+MetMelt=melt(MetSamp$ImSample, measure.vars=c("XLoc"))
+MetMelt$L3=paste(MetMelt$L1, MetMelt$L2, sep="_")
+##############################################
+## Combine individual cell information: Useful for boxplots
+##############################################
+df.New37=rbind(cbind(PreSurgMelt, type="Pre"),
+             cbind(PostSurgMelt, type="Post"),
+             cbind(MetMelt, type="Met"))
+df.New37$XLoc=df.New37$value
+df.New37=df.New37[ ,-c(grep("variable", colnames(df.New37)), grep("value", colnames(df.New37)))]
+df.New37=df.New37[which(df.New37$CellLabels=="Tumour"), ]
+df.New37$L4=paste(df.New37$L1, df.New37$type, sep="_")
+# remove all information
+```
+
+Below is a summary of the number of tumour cells counted for each patient sample (stored in <tt> df.New37</tt>). This table is included in **Supplementary Table 2**
+
+```{r}
+x1=table(df.New37$L1, df.New37$type)
+print(x1)
+```
+
+## Clinical data
+
+Clinical data including grade, stage, histology and treatment regime is stored in <tt> PatClin</tt> and is shown in **Supplementary Table 1**
+
+```{r}
+# load data
+PatClin=read.csv("data/SuppTable1.csv", header=T) 
+PatClin$Sample[1:5]=paste("00", PatClin$Sample[1:5], sep="")
+df.New37$pCR_updated=PatClin$neoadjuvant.response[match(df.New37$L1, PatClin$Sample)]
+AmpScore=read.delim("data/manual_amplicon_scores.txt", header=T, sep="\t", 
+                    colClasses=c('character',rep('numeric', 6)))
+```
+
+# Introducing the image data
+
+For each image, we capture the staining intensity and shape parameters as well as locational information for every tumor cell following analysis in <tt> GoIFISH</tt>. 
+
+Cells are discretised as negative or positive for different markers based on the following cut-offs:
+* ER: 50
+* HER2 membrane: 300
+* Her2 (and Cep17) CN: 63, 200 (pixel area) for normal, gain and high level amplifications.
+
+These cutoffs were derived from **Trinh et al, Genome Biology 2014**.
+
+An example image is patient 7588. We can show the location of different cell types in the pre-treatment biopsy and the post-treatment biopsy, as shown in **Figure 1:E,F**
+
+```{r}
+df.New37$classER=cut(df.New37$nucl_NucAdjustedInt, c(-1,50, 1000), labels=c("ER-","ER+"))
+df.New37$classHER=cut(df.New37$memb_BackAdjustedInt, c(-1,300, 4000), labels=c("HER-","HER+"))
+df.New37$classHer2g=cut(df.New37$Her2_Area, c(-1,63,200,10000), labels=c("normal","gain", "amp"))
+# modify ER for patients 53, 6450, 7363 and 7370
+SIds=c("0053", "6450", "7363", "7370")
+df.New37$classER[df.New37$L1%in%SIds]=cut(df.New37$nucl_BackgroundAdjust[df.New37$L1%in%SIds], c(-1,50, 1000), labels=c("ER-","ER+"))
+
+df.New37$PhenGen=paste(df.New37$classER, df.New37$classHER, df.New37$classHer2g, sep="")
+   
+df.New37$Pheno=paste(df.New37$classER, df.New37$classHER, sep="")
+
+Pat7588=df.New37[df.New37$L1=="7588", ]
+qplot(XLoc, 3050-YLoc, data=Pat7588, col=Pheno)+geom_point(aes(size = dapi_Area))+facet_grid(~L4)+labs(x="X co-ordinate", y="Y co-ordinate")
+```
+
+As we can see, the cellular population shifts from a mixture of HER2+ (both ER+ and ER-) to primarily ER+ and HER2- population. The cell size also increases, as shown by <tt> dapi Area</tt>.
+
+We can also summarise the cellular distribution across all biopsies at a given time point (i.e. a patient may have two pre-treatment biopsies) based on markers of interest, as shown below (and in **Figure 1G**): We see that the pre-surgery samples have a much higher HER2 intensity and higher Her2 CN. In comparison, the post-surgery samples have lost cells with high Her2CN and are more phenotypically diverse.
+
+```{r}
+qplot(nucl_NucAdjustedInt, memb_BackAdjustedInt, data=Pat7588, col=Pheno)+geom_point(aes(size = Her2_Area))+facet_grid(~L4)+labs(x="ER intensity", y="HER2 intensity")
+```
+
+These types of plots are shown for all patients before and after surgery in **Supplemental Figure 3** (looking at HER2 and ER co-expression) and **Supplemental Figure 4** (HER2 and HerCN co-expression).
+
+# "Bulk tumor" analysis
+
+For each patient, we computed one summary output for each feature (eg. HER2 protein expression, cent 17 copy number) which was the mean value across all tumor cells in all images of primary samples. Here, we sought to determine whether this summary statistic could be predictive of (i) patient outcome to (anti-HER2) treatment **Supplemental Figure 2A** or (ii) metastasis **Figure 2A**
+
+## Association with patient response to treatment
+
+Look at our main variables of interest: HER2 membrane intensity, Her2 CN, ER intensity and CEP17. Do any of these associate with complete response (pathological complete response, pCR) to therapy?
+
+```{r}
+SampNam1=c("cent_Area", "Her2_Area", "nucl_NucAdjustedInt", "nucl_BackgroundAdjust", "memb_BackAdjustedInt", "Her2_centRatio")
+l1=na.omit(match(SampNam1, colnames(df.New37)))
+SummData=sapply(l1,function(x) unlist(by(df.New37[ ,x], df.New37$L4, mean, na.rm=T)))
+SummDataPost=SummData[grep("Post", rownames(SummData)), ]
+SummData=SummData[grep("Pre", rownames(SummData)), ]
+
+colnames(SummData)=SampNam1
+SummData=data.frame(SummData)
+SummData$Pat=substr(rownames(SummData), 1,4)
+
+SummData$ERint = ifelse(SummData$Pat %in% c("0053", "6450", "7363", "7370"), 
+                  SummData$nucl_BackgroundAdjust,
+                  SummData$nucl_NucAdjustedInt)
+SummData=SummData[ ,-match(c("nucl_NucAdjustedInt", "nucl_BackgroundAdjust"),
+                           colnames(SummData))]
+
+SummDataPreAmelt=melt(SummData)
+SummDataPreAmelt$pCR=PatClin$neoadjuvant.response[match(SummDataPreAmelt$Pat, PatClin$Sample)] 
+SummDataPreAmelt$pCR=ifelse(SummDataPreAmelt$pCR=="CR", "CR", "nCR")
+
+qplot(pCR, log10(value), fill=pCR, data=SummDataPreAmelt, geom="boxplot")+facet_grid(~variable)+geom_point(aes(colour = pCR))+scale_fill_brewer(palette = "Set1")+scale_color_brewer(palette = c("Pastel1"))
+```
+
+What are the number of patients who have pathological complete response (pCR) compared to non-complete response (nCR)?
+
+```{r}
+summary(factor(SummDataPreAmelt$pCR[SummDataPreAmelt$variable=="Her2_centRatio"]))
+```
+
+Are any of the above differences significant using a t test?
+
+```{r}
+SampNam=levels(SummDataPreAmelt$variable)
+wtest=rep(NA, 5)
+for (i in 1:5){
+wtest[i]=t.test(value~pCR, subset(SummDataPreAmelt, variable==SampNam[i]))$p.value
+}
+names(wtest)=SampNam
+wtest
+```
+
+Differences in Her2 area (CN) are significantly different between pCR and nCR, where pCR appear to have higher counts, as shown in **Supplemental Figure 2A**
+
+## Association with metastasis
+
+Perform the same analysis looking at metastasis instead of treatment response:
+
+```{r}
+SummDataPreAmelt$met=PatClin$Distant.Metastases[match(SummDataPreAmelt$Pat, PatClin$Sample)] #=="CR"
+qplot(met, log10(value), fill=met, data=SummDataPreAmelt, geom="boxplot")+facet_grid(~variable)+geom_point(aes(colour = met))+scale_fill_brewer(palette = "Set1")+scale_color_brewer(palette = c("Pastel1"))
+```
+
+Summary of patient outcome:
+```{r}
+summary(factor(SummDataPreAmelt$met[SummDataPreAmelt$variable=="Her2_centRatio"]))
+```
+
+
+Test for significance:
+```{r}
+wtest=rep(NA, 5)
+for (i in 1:5){
+wtest[i]=t.test(value~met, subset(SummDataPreAmelt, variable==SampNam[i]))$p.value
+}
+names(wtest)=SampNam
+wtest
+```
+
+Differences: lower ER expression, lower Her2/cent ratio and perhaps lower Her2 CN is associated with metastasis. Despite the difference in Her2 CN, there appears to be no effect on HER2 expression (**Figure 2A**).
+
+## Differences in samples after therapy
+
+We can do the same analysis looking at differences between samples before and after therapy (**Suppplementary Figure 7**): Here we are focused on changes that happens before and after therapy, and thus remove samples which have pathological complete response.
+
+```{r}
+
+#SummDataPreA=SummData[ ,l1]
+colnames(SummDataPost)=SampNam1
+SummDataPost=data.frame(SummDataPost)
+SummDataPost$Pat=substr(rownames(SummDataPost), 1,4)
+
+SummDataPost$ERint=SummDataPost$nucl_NucAdjustedInt
+SummDataPost=SummDataPost[ ,-match(c("nucl_NucAdjustedInt", "nucl_BackgroundAdjust"),
+                           colnames(SummDataPost))]
+
+SummDataTot=rbind(SummData, SummDataPost)
+SummDataTot$type=substr(rownames(SummDataTot), 6,8)
+idxrm=PatClin$Sample[PatClin$neoadjuvant.response=="CR"]
+
+SummDataTot=SummDataTot[-which(SummDataTot$Pat%in%idxrm),  ]
+SummDataTotmelt=melt(SummDataTot)
+
+qplot(type, log10(value), fill=type, data=SummDataTotmelt, geom="boxplot")+facet_grid(~variable)+geom_point(aes(colour = type))+scale_fill_brewer(palette = "Greens")+scale_color_brewer(palette = c("Reds"))
+
+```
+
+Test for significance:
+```{r}
+wtest=rep(NA, 5)
+for (i in 1:5){
+wtest[i]=t.test(value~type, subset(SummDataTotmelt, variable==SampNam[i]))$p.value
+}
+names(wtest)=SampNam
+wtest
+```
+
+# Single cell analysis: association between different markers
+
+We can determine whether there are relationships between different markers of interest before and after therapy. This can be used to answer questions such as does HER2 protein increase with HER2 copy number?
+
+We can illustrate this for patient 7588, as shown in **Supplemental Figure 3 and 4**
+
+```{r}
+qplot(nucl_NucAdjustedInt, memb_BackAdjustedInt, data=Pat7588, col=type)+labs(x="ER intensity", y="HER2 intensity")
+qplot(Her2_Area, memb_BackAdjustedInt, data=Pat7588, col=type)+labs(x="HER2 CN area", y="HER2 intensity")
+
+```
+
+we can also compute the correlation between these features in both the primary and the post-treatment sample:
+
+```{r}
+
+print('Comparing ER and HER2:')
+print('pre surgery')
+cor.test(Pat7588$nucl_NucAdjustedInt[Pat7588$type=="Pre"], Pat7588$memb_BackAdjustedInt[Pat7588$type=="Pre"], use="complete", method="spearman")
+print('post surgery')
+cor.test(Pat7588$nucl_NucAdjustedInt[Pat7588$type=="Post"], Pat7588$memb_BackAdjustedInt[Pat7588$type=="Post"], use="complete", method="spearman")
+
+print('Comparing HER2 protein and gene:')
+print('pre surgery')
+cor.test(Pat7588$Her2_Area[Pat7588$type=="Pre"], Pat7588$memb_BackAdjustedInt[Pat7588$type=="Pre"], use="complete")
+print('post surgery')
+cor.test(Pat7588$Her2_Area[Pat7588$type=="Post"], Pat7588$memb_BackAdjustedInt[Pat7588$type=="Post"], use="complete")
+
+```
+
+There appears to be an association between HER2CN and expression in the pre-surgery samples, but not the post surgery samples
+
+We can repeat this for the entire cohort to determine which cases have a correlation:
+
+```{r}
+index=unique(df.New37$L4)
+index=index[-grep("Met", index)]
+S1=sapply(index[-55], function(x) cor.test(df.New37$nucl_NucAdjustedInt[which(df.New37$L4==x)], df.New37$memb_BackAdjustedInt[which(df.New37$L4==x)],
+                                      use="complete", method="spearman")$p.value)
+S2=sapply(index[-c(48, 55)], function(x) cor.test(df.New37$Her2_Area[which(df.New37$L4==x)], df.New37$memb_BackAdjustedInt[which(df.New37$L4==x)],
+                                      use="complete", method="spearman")$p.value)
+
+Rslt=matrix(NA, nrow=length(index), ncol=2)
+Rslt[ -55,1]=-log10(S1+0.001)
+Rslt[ -c(48,55),2]=-log10(S2+0.001)
+
+X1=grep("Pre", index)
+
+T1=Rslt[X1, ]
+rownames(T1)=substr(index[X1], 1, 4)
+T2=substr(index[-X1], 1,4)
+lmatch= match(T2, rownames(T1))
+
+T1=cbind(T1, NA, NA)
+
+T1[lmatch, 3:4]=Rslt[-X1, ]
+image(t(T1[X1, ]), col=brewer.pal(6, "Blues"), xaxt="n", yaxt="n")
+axis(2, at=seq(0, 1, length=nrow(T1)), rownames(T1), las=2)
+axis(1, at=seq(0, 1, length=4), c("Pre ER v HER2","Pre HER2 v CN","Post ER v HER2","Post HER2 v CN"  ))
+```
+
+Dark blue indicates significant correlation between two parameters of interest, and white indicate no correlation by spearman correlation.
+
+# Single cell analysis: Unsupervised clustering of primary samples
+
+Using the measurements attained at the single cell level, we can classify cells into different groups according to their ER, HER2 and Her2 (CN) status. For each patient, we can determine the cellular fraction of each cellular subtype (eg. 90% HER2+,ER-, 7% HER2-ER-,3% HER2+ER+ 0% HER2-ER-) and determine which patients are similar and different from each other:
+
+## Clustering based on Phenotype (ER/HER2 subpopulations)
+
+```{r}
+Gen=table(df.New37$L4, df.New37$classHer2g)
+Phen=table(df.New37$L4, df.New37$Pheno)
+GPtab=table(df.New37$L4, df.New37$PhenGen)
+
+Gen=Gen/rowSums(Gen)
+Phen=Phen[ ,-5]/rowSums(Phen[ ,-5])
+GPtab=GPtab[ , -grep("NA", colnames(GPtab))]
+GPtab=GPtab/rowSums(GPtab)
+
+GenA=as.data.frame.matrix(Gen)
+GenA$type=substr(rownames(Gen), 6, 9)
+GenA$ID=substr(rownames(Gen), 1, 4)
+PhenA=as.data.frame.matrix(Phen)
+PhenA$type= substr(rownames(Phen), 6, 9)
+PhenA$ID=substr(rownames(Phen), 1, 4)
+GPA=as.data.frame.matrix(GPtab)
+GPA$type=substr(rownames(GPtab), 6, 9)
+GPA$ID=substr(rownames(GPtab), 1, 4)
+```
+
+Here, we see three main groups: P1 is characterised by a large population of HER2+ER+ cells. P2 is mainly HER2+ER- and P3 appears to be more ER-like and excluded from further analysis. Note for some samples, use the ER background adjusted intensity ("0053", "6450", "7363", "7370"). This plot is shown in **Figure 3A**
+
+```{r}
+ Phen=subset(PhenA, type=="Pre")
+  PhenClin=merge(Phen, PatClin,by.x="ID", by.y="Sample", all.x=T)    
+   Phenclust=Phen[, 1:4]-0.25
+  
+   Surv=PhenClin$Status.at.the.time.of.last.follow.up
+   Met=PhenClin$Distant.Metastases
+  PhenClin$ERpc=rowSums(Phen[ ,3:4])
+  PhenClin$ERpcCut=cut(PhenClin$ERpc, c(-1, 0.01, 0.11, 0.51, 1.1), c("<1%", "<10%", "<50%", "50%+"))
+ 
+  plot.init(tree=c(2,3), cbar=2, text=c(1, 5))
+ hcluster(Phenclust, clust="col", distance="euclidean", linkage="complete")
+  hcluster(Phenclust, clust="row", distance="euclidean", linkage="complete")
+  subclust(3, clust="row", method="part")
+  plot.hmap(Phenclust, cex=10, colorscale=c("blue","white", "red"))
+  z1 = set.color(Met, label="met", type="discrete", color=c("#33a02c", "#fb9a99"))
+  z2 = set.color(Surv, label="surv", type="discrete", color=c("#a8ddb5","#00ffff"))
+  z3 = set.color(PhenClin$ERpcCut, label="er", type="discrete", color=c("red", "#33a02c","blue", "#fdbf6f"))
+  plot.cbar(z1,z2,z3,  pvalue=T, pvalue.method="fisher", border="black", side=2)
+  plot.tree(side=2)
+  plot.tree(side=3)
+  plot.text(colnames(Phenclust), cex=1, side=1)
+  plot.text(rownames(Phenclust), cex=1, side=4)
+  plot.hmap.key()
+  PhenClin$clustPhen=paste("P", .CLUSTERMAP$rowgroup, sep="")
+  PhenClin$clustPhenO=factor(paste("P", .CLUSTERMAP$rowgroup, sep=""))
+  PhenClin$clustPhen[PhenClin$clustPhen=="P3"]=NA
+  PhenClin$clustPhen=factor(PhenClin$clustPhen)
+```
+
+Note that the column side bar has three entries: ER percentage, survival and metastasis
+
+* Survival: cyan: dead, green:alive
+* Progression: pink: metastasis, green: no metastasis
+* ER status: red <1%, green <10%, blue <50%, orange >50%
+
+The number of cases in each group are:
+
+```{r}
+summary(factor(PhenClin$clustPhen))
+```
+
+Note that P3 have very few patients and are excluded from further analysis
+
+### Clustering based on Genotype (Her2 amplification)
+
+We can also do this on the genomic level. Here, the cut-offs are a pixel are of 63 (equivalent to 3 spots) and 200 (approximately 8-10 spots). Three groups are summarised: normal (less than 3 copies), low level gain (3-10 copies), and high level amplification. This plot is shown in **Figure 4A**
+
+
+```{r}
+  Gen=subset(GenA, type=="Pre")
+  PhenClin=merge(Gen, PhenClin, by.x="ID", by.y="ID")    
+   clustHer2=PhenClin[, 2:4]-0.33
+
+  Surv=PhenClin$Status.at.the.time.of.last.follow.up
+  Met=PhenClin$Distant.Metastases
+  rownames(clustHer2) = PhenClin$ID
+
+  plot.init(tree=c(2,3), cbar=2, text=c(1,1))
+  hcluster(clustHer2, clust="col", distance="euclidean", linkage="complete")
+  hcluster(clustHer2, clust="row", distance="euclidean", linkage="complete")
+  subclust(3, clust="col", method="gap")
+  subclust(3, clust="row", method="gap")
+  plot.hmap(clustHer2, cex=10, colorscale="blue-white-red")
+  z1 = set.color(Met, label="met", type="discrete", color=c("#33a02c", "#fb9a99"))
+  z2 = set.color(Surv, label="surv", type="discrete", color=c("#a8ddb5","#00ffff"))
+  z3 = set.color(PhenClin$ERpcCut, label="er", type="discrete", color=c("red", "#33a02c","blue", "#fdbf6f"))
+  plot.cbar(z1,z2,z3,  pvalue=T, pvalue.method="fisher", border="black", side=2)
+  plot.tree(side=2)
+  plot.tree(side=3)
+  plot.text(colnames(clustHer2), cex=1, side=1)
+  plot.text(rownames(clustHer2), cex=1, side=4)
+  plot.hmap.key()
+PhenClin$clustGen= factor(paste("G", .CLUSTERMAP$rowgroup, sep=""))
+```
+
+Three clusters are present. G1 appears to dominated by the "gain" population. G2 is at the other extreme and almost all cells have high level amplification. G3 is an intermediate which have a high level of CN amp cells but other classes are also present.
+
+Note that the column side bar has three entries (similar to the phenotype plot): ER percentage, survival and metastasis
+
+* Survival: cyan: dead, green:alive
+* Progression: pink: metastasis, green: no metastasis
+* ER status: red <1%, green <10%, blue <50%, orange >50%
+
+The number of samples in each cluster are:
+
+```{r}
+summary(factor(PhenClin$clustGen))
+```
+
+### Combined pheno-genotype
+
+```{r, eval=F}
+##Look at the distribution of the different populations
+ll1=melt(GPtab[grep("Pre", rownames(GPtab)), ])
+ggplot(aes(x = Var2, y=value), data=ll1)+geom_boxplot()+theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+Perform clustering based on both phenotype and genotype, giving 12 distinct classes (based on 2: ER, 2:HER2, 3: Her2CN). This figure is shown in **Supplementary Figure 5A**
+
+```{r}
+  GPtabB=GPtab[grep("Pre", rownames(GPtab)), ]
+ # PhenClin=merge(GPtab, PhenClin, by.x="ID", by.y="ID")    
+  clustHer2=GPtabB-0.125
+
+  Surv=PhenClin$Status.at.the.time.of.last.follow.up
+  Met=PhenClin$Distant.Metastases
+  rownames(clustHer2) = PhenClin$ID
+ 
+
+  plot.init(tree=c(2,3), cbar=2, text=c(1,3))
+  hcluster(clustHer2, clust="col", distance="euclidean", linkage="complete")
+  hcluster(clustHer2, clust="row", distance="euclidean", linkage="complete")
+  subclust(3, clust="col", method="gap")
+  subclust(3, clust="row", method="gap")
+  plot.hmap(clustHer2, cex=10, colorscale="blue-white-red")
+  z1 = set.color(Met, label="met", type="discrete", color=c("#33a02c", "#fb9a99"))
+  z2 = set.color(Surv, label="surv", type="discrete", color=c("#a8ddb5","#00ffff"))
+  z3 = set.color(PhenClin$ERpcCut, label="er", type="discrete", color=c("red", "#33a02c","blue", "#fdbf6f"))
+  plot.cbar(z1,z2,z3,  pvalue=T, pvalue.method="fisher", border="black", side=2)
+  plot.tree(side=2)
+  plot.tree(side=3)
+  plot.text(colnames(clustHer2), cex=1, side=1)
+  plot.text(rownames(clustHer2), cex=1, side=4)
+  plot.hmap.key()
+PhenClin$clustPG= factor(paste("PG", .CLUSTERMAP$rowgroup, sep=""))
+```
+
+Three main clusters are present: an HER2+ER+amp+ group (PG2), a HER2+ER-amp+ group (PG3) and a highly heterogeneous group (PG1):
+
+The number of samples in each cluster are:
+
+```{r}
+summary(factor(PhenClin$clustPG))
+```
+
+
+```{r, eval=F}
+# Can also regreoup the clusters, combining gain and normal cells together (differentiate between amp and non amp)
+
+tab2=paste(df.New37$classER, df.New37$classHER, ifelse(df.New37$classHer2g=="amp", "amp", "notamp"), sep="")
+GPtab2=table(df.New37$L4, tab2)
+GPtab2=GPtab2[ , -grep("NA", colnames(GPtab2))]
+GPtab2=GPtab2/rowSums(GPtab2)
+
+GPtab2=GPtab2[grep("Pre", rownames(GPtab2)), ]
+  clustHer2=GPtab2
+
+  plot.init(tree=c(2,3), cbar=3,  text=c(1,5))
+  hcluster(clustHer2, clust="col", distance="euclidean", linkage="complete")
+  hcluster(clustHer2, clust="row", distance="euclidean", linkage="complete")
+  subclust(3, clust="col", method="gap")
+  subclust(3, clust="row", method="gap")
+  plot.hmap(clustHer2, cex=10, colorscale="blue-white-red")
+  z1 = set.color(Met, label="met", type="discrete", color=c("red", "pink"))
+  z2 = set.color(Surv, label="surv", type="discrete", color=c("blue", "cyan"))   
+  plot.cbar(z1,z2,  pvalue=T, pvalue.method="fisher", border="black", side=2)
+  plot.tree(side=2)
+  plot.tree(side=3)
+  plot.text(colnames(clustHer2), cex=1, side=1)
+  plot.text(rownames(clustHer2), cex=1, side=4)
+  plot.hmap.key()
+PhenClin$clustPG2= paste("PG2", .CLUSTERMAP$rowgroup, sep="")
+colnames(clustHer2)
+.CLUSTERMAP$colgroup
+```
+
+```{r, eval=F}
+
+## Shannon Index: Primary samples 
+Is there an association between Genotypic and Phenotypic heterogeneity?
+par(mfrow=c(1,2))
+# Compute entropy values too
+PhenClin$GenEnt=sapply(1:nrow(Gen), function(x) EntropyByFrac(Gen[x,1:3]))
+PhenClin$PhenEnt=sapply(1:nrow(Phen), function(x) EntropyByFrac(Phen[x,1:4]))
+PhenClin$GenPhenEnt=sapply(1:nrow(GPtab), function(x) EntropyByFrac(GPtab[x,1:12]))
+plot(PhenClin$GenEnt, PhenClin$PhenEnt, xlab="Genetic entropy", ylab="phenotypic entropy", col=ifelse(PhenClin$neoadjuvant.response=="CR", "red", "black"), pch=19)
+text(0.5, 1.1, sprintf("cor = %g", round(cor(PhenClin$GenEnt, PhenClin$PhenEnt)*100)/100))
+```
+
+Compute Shannon index to see if any specific cluster has a difference in heterogeneity: Compare entropy in the three classes?
+
+```{r, eval=F}
+par(mfrow=c(2,2))
+boxplot(PhenClin$GenEnt~PhenClin$clustGen, main="genetic diversity")
+boxplot(PhenClin$PhenEnt~PhenClin$clustPhen, main="phenotype diversity")
+boxplot(PhenClin$GenPhenEnt~PhenClin$clustPG, main="geno-phenotype diversity")
+```
+
+# Associations between clusters and clinical parameters
+
+Here, we wish to determine whether any of the aforementioned clusters is associated with patient outcome:
+
+## Association between genetic and phenotype clusters
+
+First look at whether there is any associations between the genetic and phenotypic clustering
+
+```{r}
+m1=table(PhenClin$clustGen, PhenClin$clustPhen)
+m1
+
+chisq.test(m1)
+```
+
+There appears to be an association between the genetic and phenotype clusters, whereby most P2 patients are also G3.
+
+## Associations with other clinical variables
+
+```{r}
+PhenClin$ERpos=ifelse(PhenClin$ERpcCut=="<1%", "no", "yes")
+
+TestVar=c("ERpos","ERpcCut", "neoadjuvant.response", "Distant.Metastases", "Status.at.the.time.of.last.follow.up", "Stage", "Grade", "HER2.IHC", "PgR_IHC", "histology")
+
+tabCor=matrix(NA, ncol=3, nrow=length(TestVar))
+
+for (i in 1:length(TestVar)){
+  tab1=table(factor(PhenClin[ ,match(TestVar[i], colnames(PhenClin))]), PhenClin$clustPhenO)
+  tabCor[i, 1]=fisher.test(tab1)$p.value
+  tab1=table(factor(PhenClin[ ,match(TestVar[i], colnames(PhenClin))]), PhenClin$clustGen)
+  tabCor[i, 2]=fisher.test(tab1)$p.value
+    tab1=table(factor(PhenClin[ ,match(TestVar[i], colnames(PhenClin))]), PhenClin$clustPG)
+  tabCor[i, 3]=fisher.test(tab1)$p.value
+}
+
+tabCor2=-log10(tabCor)
+par(oma=c(0, 3, 0, 0))
+image(t(tabCor2), xaxt="n", yaxt="n", col=brewer.pal(9, "Blues"))
+axis(3, at=seq(0,1, length=3), c("Phen", "Gen", "Phen-Gen"))
+axis(2, at=seq(0,1, length=length(TestVar)), TestVar, las=2)
+```
+
+Above is a heatmap of -log10 p values for associations between the clusters and different clinical parameters. The darker the color, the more significant the association by fisher exact test. For example, there is a strong association between the ER clusters, PR and the phenotype or pheno-genotype clusters (which is expected). 
+
+Also, there appears to be an association between distant metastasis and HER2 IHC with genotype or geno-phenotype clusters.
+
+```{r}
+colnames(tabCor)=c("Phen", "Gen", "Phen-Gen")
+rownames(tabCor)=TestVar
+
+tabCor
+```
+
+# Patient survival data
+
+Here, we sought to determine whether cluster group (P series, G series or PG series) is associated with survival outcome (breast cancer specific death, or metastasis). All risk tables and p values are computed using the <tt> survminer </tt> package. Due to the small number of events (~13 in total), cox proportional hazards models were not used in the following analyses.
+
+## Clusters and Breast Cancer Specific Death
+
+ These KM curves are shown in **Figures 3C and 4D and Supplemental Figure 5B**
+
+```{r, fig.height=8}
+ssOS=Surv(PhenClin$MontSurgFinal, PhenClin$Status.at.the.time.of.last.follow.up!="alive")
+
+a1=coxph(ssOS~PhenClin$clustGen)
+a3=coxph(ssOS~clustPG, data=PhenClin)
+a2=coxph(ssOS~clustPhen, data=PhenClin)
+
+s1=survfit(ssOS~PhenClin$clustGen)
+s3=survfit(ssOS~PhenClin$clustPG)
+s2=survfit(ssOS~PhenClin$clustPhen)
+```
+
+```{r, fig.height=5, fig.width=5}
+ggPlotSurv(s1, PhenClin, "genotype", pal=c("skyblue", "orange","darkgreen"))
+ggPlotSurv(s2, PhenClin, "phenotype", pal=c("black", "red"))
+ggPlotSurv(s3, PhenClin, "geno-phenotype", pal=c( "purple","darkgreen","skyblue"))
+```
+
+```{r,eval=F}
+## compute the statistics
+print('OS based on genotype')
+summary(a1)
+print('OS based on phenotype')
+summary(a2)
+print('OS based on geno-phenotype')
+summary(a3)
+```
+
+## Clusters and Disease Progression (Metastasis)
+
+Instead of overall survival, we can look at time to metastasis. The following plots are included in **Figure 4D, and Supplementary Figure 5C**
+
+```{r}
+#PhenClin$EndFollowTime=PatClinComplete$EndFollow[match(PhenClin$ID, PatClinComplete$Sample)]
+
+par(mfrow=c(2,2))
+ssDFS=Surv(PhenClin$EndFollow, PhenClin$Distant.Metastases=="yes")
+
+a1=coxph(ssDFS~PhenClin$clustGen)
+a3=coxph(ssDFS~clustPG, data=PhenClin)
+a2=coxph(ssDFS~clustPhen, data=PhenClin)
+
+s1=survfit(ssDFS~PhenClin$clustGen)
+s3=survfit(ssDFS~PhenClin$clustPG)
+s2=survfit(ssDFS~PhenClin$clustPhen)
+```
+
+```{r, fig.height=5, fig.width=5}
+ggPlotSurv(s1, PhenClin, "genotype", pal=c("skyblue", "orange","forestgreen"))
+ggPlotSurv(s2, PhenClin, "phenotype", pal=c("black", "red"))
+ggPlotSurv(s3, PhenClin, "geno-phenotype", pal=c( "purple","darkgreen","skyblue"))
+```
+
+## OS based on ER status
+
+We can also look at the impact variation in ER expression has on overall survival. This is featured in **Figure 3D**
+
+```{r}
+PhenClin$ERdiv=-PhenClin$ERpc*log10(PhenClin$ERpc)-(1-PhenClin$ERpc)*log10(1-PhenClin$ERpc)
+PhenClin$ERdiv[which(is.na(PhenClin$ERdiv))]=0
+
+PhenClin$ERpcTwo=cut(PhenClin$ERdiv, c(-0.1, 0.2, 1.1), c("L", "H"))
+
+s1=survfit(ssOS~PhenClin$ERpcCut)
+s2=survfit(ssDFS~PhenClin$ERpcCut)
+s3=survfit(ssOS~PhenClin$ERpcTwo)
+
+ggPlotSurv(s1, PhenClin, "ER subtype OS", pal=c("red", "green", "blue", "orange"))
+ggPlotSurv(s2, PhenClin, "ER subtype DFS", pal=c("red", "green", "blue", "orange"))
+ggPlotSurv(s3, PhenClin, "ER low high div", pal=c("black", "red"))
+
+```
+
+
+# Amplicon type
+
+From manual scoring we have noticed three types of amplicon distributions: (i) scattered where distinct spots are observed throughout the nucleus (ii) clustered where a high intensity large spot is noticed in one or two locations within the nucleus and (iii) mixed: a mixture of the above two.
+
+## Distributions in primary and relapsed samples 
+We can plot the distributions of these different types in a triangle plot, and color code the entries based on their outcome:
+
+```{r}
+AmpScore=merge(AmpScore, PatClin[ ,c("Sample","neoadjuvant.response" ,"Distant.Metastases")], by.x="ID", by.y="Sample")
+AmpScore$PCR=ifelse(AmpScore$neoadjuvant.response=="CR", "CR", "nCR")
+AmpScore$ERstatus=PhenClin$ERpcCut[match(AmpScore$ID, PhenClin$ID)]
+Before=AmpScore[ ,c(2:4)]/rowSums(AmpScore[ ,c(2:4)])
+After=AmpScore[ ,c(5:7)]/rowSums(AmpScore[ ,c(5:7)])
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+palette(c("#1f78b4","#e31a1c"))
+triax.plot(Before, col.symbols=as.factor(AmpScore$PCR), axis.labels = c("cluster", "scatter",  "mix"), pch=19, show.grid=T, main="pCR Pre")
+palette(c("red", "#33a02c","blue", "#fdbf6f"))
+triax.plot(Before, col.symbols=as.factor(AmpScore$ERstatus), axis.labels = levels(AmpScore$ERstatus), pch=19, show.grid=T, main="ERstatus Pre")
+```
+
+Here we have color coded:
+* pCR: black, nCR: red
+* ER neg: red, <10%: black, <50% green, 50%+ yellow 
+
+Note that almost all scattered samples are non-CR, those which are more "mixed" like appear to do better.
+
+Similarly, ER negative or low ER expressing samples have a clustered phenotype.
+
+We can see how this distribution changes following therapy:
+
+```{r}
+par(mfrow=c(1,2))
+AfterNa=which(is.na(After[ ,1]))
+palette(c("#1f78b4","#e31a1c"))
+triax.plot(After[-AfterNa, ], col.symbols=as.factor(AmpScore$PCR[-AfterNa]), axis.labels = c("cluster", "scatter",  "mix"), pch=19, show.grid=T, main="pCR Post", na.rm=T)
+palette(c("red", "#33a02c","blue", "#fdbf6f"))
+triax.plot(After[-AfterNa, ], col.symbols=as.factor(AmpScore$ERstatus[-AfterNa]), axis.labels = c("cluster", "scatter",  "mix"), pch=19, show.grid=T, main="ER status Post")
+```
+
+We can also view these distributions with respect to metastasis and ER status (**Supplemental Figure 6:A,B**)
+
+```{r}
+AmpScore$ERstatus2=ifelse(AmpScore$ERstatus=="<1%", "neg", "pos")
+par(mfrow=c(1,2))
+palette(c("black","grey"))
+triax.plot(Before, col.symbols=as.factor(AmpScore$Distant.Metastases), axis.labels = c("cluster", "scatter",  "mix"), pch=19, show.grid=T, main="Metastasis Pre")
+palette(c("black", "red"))
+triax.plot(Before, col.symbols=as.factor(AmpScore$ERstatus2), axis.labels = c("cluster", "scatter",  "mix"), pch=19, show.grid=T, main="ERstatus Pre")
+```
+
+
+## Association with other clinical variables
+
+We can determine whether there is an association with other clinical variables (Eg. ER status or pathological response to treatment) using a chi-sq test:
+
+```{r}
+
+BeforeClass=ifelse(Before[ ,1]>=0.7, "cluster", ifelse(Before[ ,2]>=0.7, "scatter", ifelse(Before[ ,3]>=0.7, "mix", "het")))
+PhenClin$ampType=BeforeClass[match(PhenClin$ID, AmpScore$ID)]
+
+PhenClin$pCR=ifelse(PhenClin$neoadjuvant.response=="CR", "pCR", "nCR")
+
+print('association with response to treatment')
+tab1=table(factor(PhenClin$neoadjuvant.response), PhenClin$ampType)
+tab1
+fisher.test(tab1)
+
+print('association with response to treatment')
+tab1=table(factor(PhenClin$pCR), PhenClin$ampType)
+tab1
+fisher.test(tab1)
+
+
+print('association with ER status')
+tab1=table(PhenClin$ERpcCut, PhenClin$ampType)
+tab1
+fisher.test(tab1)
+
+print('association with ER status2')
+tab1=table(PhenClin$ERpcCut=="<1%", PhenClin$ampType)
+tab1
+fisher.test(tab1)
+
+print('association with metastasis')
+tab1=table(factor(PhenClin$Distant.Metastases), PhenClin$ampType)
+tab1
+fisher.test(tab1)
+
+```
+
+
+## Effect on survival
+
+Does this predict patient outcome?
+
+```{r, fig.height=5, fig.width=5}
+par(mfrow=c(1,2))
+#palette(c("black", "#33a02c", "red", "blue"))
+s1=survfit(ssDFS~PhenClin$ampType)
+s2=survfit(ssOS~PhenClin$ampType)
+
+ggPlotSurv(s1, PhenClin, "DFS ampType", c( "black","green","red",  "blue"))
+ggPlotSurv(s2, PhenClin, "DFS ampType", c("black", "green","red",  "blue"))
+```
+
+
+# Evolutionary trajectory with treatment
+
+
+```{r, eval=F}
+## Summary per sample
+
+ComDiff=SummData[ ,l1]
+colnames(ComDiff)=SampNam
+ComDiff=ComDiff[-grep("Met", rownames(ComDiff)), ]
+ComDiff=data.frame(ComDiff)
+ComDiff$type=substr(rownames(ComDiff), 6, 10)
+
+Commelt=melt(ComDiff)
+qplot(type, log10(value), fill=type, data=Commelt, geom="boxplot")+facet_grid(~variable)+geom_point(aes(colour = type))+scale_fill_brewer(palette = "Set2")+scale_color_brewer(palette = c("Pastel2"))
+
+```
+
+
+```{r, eval=F}
+## Renkonen: Changes before and after
+Compute the rekonen index for changes in genotype and phenotype.
+
+
+#par(mfrow=c(1,2))
+Gp=subset(GenA, type=="Post")
+m1=Gp$ID[Gp$ID%in%Gen$ID]
+PhenClin$GenRen=NA
+PhenClin$GenRen[PhenClin$ID%in%m1]=sapply(m1, function(x) renkonen(Gen[x, 1:3], Gp[x, 1:3]))
+
+Pp=subset(PhenA, type=="Post")
+m1=Pp$ID[Pp$ID%in%Phen$ID]
+PhenClin$PhenRen=NA
+PhenClin$PhenRen[PhenClin$ID%in%m1]=sapply(m1, function(x) renkonen(Phen[x, 1:4], Pp[x, 1:4]))
+
+plot(PhenClin$PhenRen, PhenClin$GenRen, xlab="Phenotype", ylab="Genotype", main="Renkonen change"); abline(0,1)
+```
+
+## Kullback Leibler index
+
+The Kullback Leibler index computes the differences in distribution between the primary and post-treatment sample. ie. it computes whether the cellular fractions (eg. ER+/HER2+ fractions) is similar or not to the primary sample. Below are histograms showing the KL index reflecting genetic and phenotypic changes in samples before and after therapy 
+
+```{r}
+GenA_pre=GenA[which(GenA$type=="Pre"), ]
+PhenA_pre=PhenA[which(PhenA$type=="Pre"), ]
+GenA_post=GenA[which(GenA$type=="Post"), ]
+PhenA_post=PhenA[which(PhenA$type=="Post"), ]
+
+GPA_pre=GPA[which(GPA$type=="Pre"), ]
+GPA_post=GPA[which(GPA$type=="Post"), ]
+
+idx=PhenA_pre$ID%in%PhenA_post$ID
+GenA_pre=GenA_pre[which(idx==T), -c(4,5)]
+PhenA_pre=PhenA_pre[which(idx==T), -c(5, 6)]
+GPA_pre=GPA_pre[which(idx==T), -c(13, 14) ]
+KLtest=KL(GenA_pre, GenA_post[ ,-c(4,5)], PhenA_pre, PhenA_post[ ,-c(5:6)], GPA_pre, GPA_post[ ,-c(13:14)])
+
+par(mfrow=c(1,2))
+
+hist(KLtest[ ,1], main="genotype", breaks=10)
+hist(KLtest[ ,2], main="phenotype", breaks=10)
+```
+
+We would like to see whether genotypic or phenotypic changes based on this index can predict outcome:
+
+## Genotype changes
+
+```{r}
+GenA_change=GenA_post[ ,-c(4:5)]-GenA_pre  
+```
+
+Here, we sort patients according to decreasing KL value and remove the following patients: 6450, 7363 (are pCR patients), and 7362, 7428 (technical problems):
+
+```{r}
+KLsort=KLtest[order(KLtest[ ,1]), ]
+GenA_Sorted=GenA_change[match(substr(rownames(KLsort), 1,4), substr(rownames(GenA_change), 1,4)) ,]
+
+idx=sapply(c("6450", "7363", "7362", "7428"), function(x) grep(x, rownames(GenA_Sorted)))
+GenA_Sorted=GenA_Sorted[-idx, ]
+
+plot.init( text=5)
+plot.hmap(GenA_Sorted, cex=10, colorscale=c("blue","wheat", "red"))
+plot.text(colnames(GenA_Sorted), cex=1, side=1)
+plot.text(rownames(GenA_Sorted), cex=1, side=4)
+plot.hmap.key()
+```
+
+This plot is featured in **Figure 6A**
+
+## Phenotype changes
+
+```{r}
+PhenA_change=PhenA_post[ ,-c(5:6)]-PhenA_pre  
+PhenA_change=na.omit(PhenA_change)
+```
+
+We can do the same for phenotype: Here samples 6450, 7363 and 7362 are omitted due to technical issues
+
+```{r}
+KLsort=KLtest[order(KLtest[ ,2]), ]
+PhenA_Sorted=PhenA_change[match(substr(rownames(KLsort), 1,4), substr(rownames(PhenA_change), 1,4)) ,]
+idx=sapply(c("6450", "7363", "7362"), function(x) grep(x, rownames(PhenA_Sorted)))
+PhenA_Sorted=PhenA_Sorted[-idx, ]
+
+plot.init( text=5)
+plot.hmap(PhenA_Sorted, cex=10, colorscale=c("blue","wheat", "red"))
+plot.text(colnames(PhenA_Sorted), cex=1, side=1)
+plot.text(rownames(PhenA_Sorted), cex=1, side=4)
+plot.hmap.key()
+```
+
+## Geno-Phenotype changes
+
+```{r}
+GPA_change=GPA_post[ ,-c(13,14)]-GPA_pre  
+GPA_change=na.omit(GPA_change)
+```
+
+We can do the same for phenotype: Here samples 6450, 7363 and 7362 are omitted due to technical issues
+
+```{r}
+KLsort=KLtest[order(KLtest[ ,3]), ]
+GPA_Sorted=GPA_change[match(substr(rownames(KLsort), 1,4), substr(rownames(GPA_change), 1,4)) ,]
+idx=sapply(c("6450", "7363"), function(x) grep(x, rownames(GPA_Sorted)))
+GPA_Sorted=GPA_Sorted[-idx, ]
+
+plot.init( text=5)
+plot.hmap(GPA_Sorted, cex=10, colorscale=c("blue","wheat", "red"))
+plot.text(colnames(GPA_Sorted), cex=1, side=1)
+plot.text(rownames(GPA_Sorted), cex=1, side=4)
+plot.hmap.key()
+```
+
+
+## KM curves based on genotype or phenotype changes
+
+Does the KL index associate with patient outcome? Here, we discretise patients based on the median value and determine whether this associates with OS or DFS:
+
+```{r}
+# survival based on rekonen idx
+
+PhenClin$rIdxG=NA
+PhenClin$rIdxG[match(substr(rownames(KLtest), 1, 4), PhenClin$ID)]=KLtest[ ,1]
+PhenClin$rIdxG[PhenClin$ID %in% c("6450", "7363", "7362", "7428")]=NA
+
+PhenClin$rIdxGcat=ifelse(PhenClin$rIdxG>median(PhenClin$rIdxG, na.rm = T), "high", "low")
+
+PhenClin$rIdxP=NA
+PhenClin$rIdxP[match(substr(rownames(KLtest), 1, 4), PhenClin$ID)]=KLtest[ ,2]
+PhenClin$rIdxP[PhenClin$ID %in% c("6450", "7363", "7362")]=NA
+PhenClin$rIdxPcat=ifelse(PhenClin$rIdxP>median(PhenClin$rIdxP, na.rm = T), "high", "low")
+
+
+PhenClin$rIdxPG=NA
+PhenClin$rIdxPG[match(substr(rownames(KLtest), 1, 4), PhenClin$ID)]=KLtest[ ,3]
+PhenClin$rIdxPG[PhenClin$ID %in% c("6450", "7363", "7362")]=NA
+PhenClin$rIdxPGcat=ifelse(PhenClin$rIdxPG>median(PhenClin$rIdxPG, na.rm = T), "high", "low")
+
+#
+
+par(mfrow=c(1,2))
+
+g1=survfit(ssOS~PhenClin$rIdxGcat)
+g2=survfit(ssDFS~PhenClin$rIdxGcat)
+p1=survfit(ssOS~PhenClin$rIdxPcat)
+p2=survfit(ssDFS~PhenClin$rIdxPcat)
+gp1=survfit(ssOS~PhenClin$rIdxPGcat)
+gp2=survfit(ssDFS~PhenClin$rIdxPGcat)
+
+
+
+ggPlotSurv(g1, PhenClin, "genotype OS", c("black", "red"))
+ggPlotSurv(p1, PhenClin, "phenotype OS", c("black", "red"))
+ggPlotSurv(gp1, PhenClin, "geno-phenotype OS", c("black", "red"))
+ggPlotSurv(g2, PhenClin, "genotype DFS", c("black", "red"))
+ggPlotSurv(p2, PhenClin, "phenotype DFS", c("black", "red"))
+ggPlotSurv(gp2, PhenClin, "geno-phenotype DFS", c("black", "red"))
+
+
+```
+
+This is featured in **Figure 6B**
+
+
+## Associating differences in KL with other clinicopathological parameters
+
+```{r}
+
+PhenClin$LKMet=ifelse(PhenClin$Lymph.node.metastasis=="0", "no", "yes")
+
+TestVar=c("ERpos","ERpcCut","PgR_IHC","HER2.IHC",  "Grade","Stage", "histology", "neoadjuvant.response", "Distant.Metastases", "Status.at.the.time.of.last.follow.up", "ampType", "clustPhenO", "clustGen", "clustPG", "LKMet")
+
+X1=sapply(TestVar, function(x) table(factor(PhenClin[ ,match(x, colnames(PhenClin))]), PhenClin$rIdxGcat))
+X2=sapply(X1, function(x) fisher.test(x)$p.value)
+
+X2
+```
+
+None of the above clinicopathological parametrs are associated with genetic KL index
+
+# Trajectory for metastatic samples:
+
+The patients 7435 and 7360 go on to later metastasise. We can follow the changes in the cellular composition of their tumours:
+
+## Patient 7435
+
+```{r}
+Pat7435=df.New37[df.New37$L1=="7435", ]
+qplot(nucl_NucAdjustedInt, memb_BackAdjustedInt, data=Pat7435, col=Pheno)+geom_point(aes(size = Her2_Area))+facet_grid(~L4)+labs(x="ER intensity", y="HER2 intensity")
+```
+
+We see that this patient goes from having a primarily HER2+ER- to a diverse mixture after treatment. However, the  metastatic sample appears to be more similar to the primary sample (or in fact, is enriched for HER2+ cells)
+
+
+We can also check the amplicon type for this patient and see how it changes:
+```{r}
+gidx=grep("7435", AmpScore$ID)
+AmpMet=read.delim("data/manual_amplicon_scoring_mets_only.txt")
+tab7435=rbind(data.matrix(Before[gidx, ]), data.matrix(After[gidx, ]), 
+              data.matrix(AmpMet[AmpMet$ID=="7435", -1])/100)
+
+triax.plot(tab7435, col.symbols=c("red", "green", "blue"), axis.labels = c("cluster", "scatter",  "mix"), pch=19, show.grid=T)
+```
+
+
+## Patient 7360
+
+```{r}
+Pat7360=df.New37[df.New37$L1=="7360", ]
+qplot(nucl_NucAdjustedInt, memb_BackAdjustedInt, data=Pat7360, col=Pheno)+geom_point(aes(size = Her2_Area))+facet_grid(~L4)+labs(x="ER intensity", y="HER2 intensity")
+```
+
+In contrast, patient 7360 doesn't show much difference in phenotype in its evolutionary trajectory
+
+We can also check the amplicon type for this patient and see how it changes:
+```{r}
+gidx=grep("7360", AmpScore$ID)
+AmpMet=read.delim("data/manual_amplicon_scoring_mets_only.txt")
+tab7360=rbind(data.matrix(Before[gidx, ]), data.matrix(After[gidx, ]), 
+              data.matrix(AmpMet[AmpMet$ID=="7360", -1])/100)
+
+triax.plot(tab7360, col.symbols=c("red", "green", "blue"), axis.labels = c("cluster", "scatter",  "mix"), pch=19, show.grid=T)
+```
+
+
+```{r, eval=F}
+# Summary table of all the "classifications"
+
+
+Before progression, we can create a color-coded summary table of the patient samples so far
+
+SummTab=(PhenClin[ ,c("Distant.Metastases", "pCR","ERpcCut", "clustPhen", "clustGen", "clustPG", "ampType", "rIdxGcat")]) #, "rIdxGcat"
+SummTab$Distant.Metastases=ifelse(SummTab$Distant.Metastases=="yes", 7, 1)
+SummTab$ERpcCut=as.numeric(SummTab$ERpcCut)+1.5
+SummTab$clustPhen=as.numeric(SummTab$clustPhen)+0.5
+SummTab$clustGen=as.numeric(SummTab$clustGen)+0.5
+SummTab$clustPG=as.numeric(SummTab$clustPG)+0.5
+SummTab$ampType=as.numeric(factor(SummTab$ampType))+0.5
+SummTab$rIdxGcat=as.numeric(factor(SummTab$rIdxGcat))+0.5
+SummTab$pCR=ifelse(SummTab$pCR=="pCR", 1,7)
+
+colnames(SummTab)=c("Met", "pCR", "ER", "Pclust", "Gclust", "PGclust", "amplicon", "KL")
+
+SummTab2=data.matrix(SummTab)
+palNew=(c("black", "red", "green", "blue", "orange", "grey"))
+
+SummTab2=SummTab2[order(SummTab2[ ,1], SummTab2[ ,2], SummTab2[ ,3]),  ]
+image(SummTab2, col=palNew, xaxt="n", yaxt="n")
+axis(2, at=seq(0, 1, length=ncol(SummTab)), colnames(SummTab), las=2)
+heatmap.2(t(SummTab2), trace="none", col=palNew, scale="none")
+```
+
+
+```{r, eval=F}
+
+# Linear model for outcome
+
+Can we describe changes of patient metastasis based on entropy, or percentage of positive cells alone?
+
+PhenClin$ERHER2pos=Phen[,4 ]
+PhenClin$ERnHER2pos=Phen[,2]
+PhenClin$ERnHER2n=Phen[,1]
+#SurvOut=coxph(ss~GenEnt+PhenEnt+amp+ERHER2pos+ERnHER2pos+gain, data=PhenClin)
+#summary(SurvOut)
+PhenClin$pCR=ifelse(PhenClin$neoadjuvant.response=="CR", "pCR", "nCR")
+
+print('factors predicting outcome to treatment')
+
+#pCROut=glm(factor(pCR)~GenEnt+PhenEnt+amp+ERHER2pos+ERnHER2pos+gain+ERnHER2n, data=PhenClin, family=binomial(link="logit"))
+#summary(pCROut)
+
+print('factors predicting distant metastasis')
+
+#SurvOut=glm(Distant.Metastases~GenEnt+PhenEnt+amp+ERHER2pos+ERnHER2pos+gain+ERnHER2n, data=PhenClin, family=binomial(link="logit"))
+#summary(SurvOut)
+```
+
+
+# R Session Info
+
+```{r}
+sessionInfo()
+```
